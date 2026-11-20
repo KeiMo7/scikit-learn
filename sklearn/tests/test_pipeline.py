@@ -2,9 +2,14 @@
 Test the pipeline module.
 """
 
+import base64
 import itertools
+import json
 import re
 import shutil
+import subprocess
+import sys
+import textwrap
 import time
 from tempfile import TemporaryDirectory, mkdtemp
 
@@ -2899,3 +2904,441 @@ def test_pipeline_memory_callbacks_second_fit_same_pipeline():
         assert callback.count_hooks("on_fit_task_begin") == n_task_begin - 1
         assert callback.count_hooks("on_fit_task_end") == n_task_end - 1
         assert not hasattr(pipe.named_steps["sc"], "_skl_callbacks")
+
+
+# ---------------------------------------------------------------------------
+# Chain state: export, load, replay and diff
+# ---------------------------------------------------------------------------
+
+
+def _chain_state_pipeline(random_state=0):
+    from sklearn.compose import ColumnTransformer
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.preprocessing import OneHotEncoder
+
+    return Pipeline(
+        [
+            (
+                "prep",
+                ColumnTransformer(
+                    [
+                        ("num", StandardScaler(), [0, 1]),
+                        (
+                            "cat",
+                            OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+                            [2],
+                        ),
+                    ],
+                    remainder="passthrough",
+                ),
+            ),
+            (
+                "clf",
+                RandomForestClassifier(
+                    n_estimators=4, random_state=random_state, n_jobs=1
+                ),
+            ),
+        ]
+    )
+
+
+def test_export_chain_state_returns_summary(tmp_path):
+    X, y = make_classification(n_samples=60, n_features=5, random_state=0)
+    pipe = _chain_state_pipeline().fit(X, y)
+    path = tmp_path / "state.jsonl"
+
+    summary = pipe.export_chain_state(path)
+
+    assert path.exists()
+    assert summary["n_steps"] == 2
+    assert summary["steps"][0]["name"] == "prep"
+    assert summary["steps"][1]["depends_on"] == ["prep"]
+    assert summary["steps"][0]["n_features_in"] == 5
+    # the random forest consumes a seed, the transformer does not
+    assert summary["steps"][1]["randomness"]["seeded"] is True
+    assert summary["steps"][0]["randomness"]["seeded"] is False
+
+
+def test_replay_chain_state_preserves_memory_layout(tmp_path):
+    """A Fortran-ordered fitted array must be restored Fortran-ordered.
+
+    ``PCA.components_`` is Fortran ordered.  Keeping that layout matters:
+    the BLAS call used by ``transform`` may take a different code path for
+    C-ordered operands and then differ in the last bit, which would turn an
+    exact replay into an approximate one.
+    """
+    X, y = make_classification(n_samples=60, n_features=6, random_state=0)
+    from sklearn.naive_bayes import GaussianNB
+
+    pipe = Pipeline(
+        [
+            ("imputer", SimpleImputer()),
+            ("pca", PCA(n_components=3, random_state=0)),
+            ("clf", GaussianNB()),
+        ]
+    ).fit(X, y)
+    assert pipe.named_steps["pca"].components_.flags["F_CONTIGUOUS"]
+    path = tmp_path / "state.jsonl"
+    pipe.export_chain_state(path)
+
+    restored = Pipeline.load_chain_state(path)
+    assert restored.named_steps["pca"].components_.flags["F_CONTIGUOUS"]
+    assert np.array_equal(
+        restored.named_steps["pca"].components_, pipe.named_steps["pca"].components_
+    )
+    report = pipe.replay_chain_state(path, X)
+    assert report["exact"] is True
+    assert all(step["exact"] for step in report["steps"])
+
+
+def test_chain_state_excludes_training_data(tmp_path):
+    """The one hard constraint: the training matrix never reaches the file."""
+    X, y = make_classification(n_samples=60, n_features=5, random_state=0)
+    pipe = _chain_state_pipeline().fit(X, y)
+    path = tmp_path / "state.jsonl"
+    pipe.export_chain_state(path)
+
+    payload = path.read_text()
+    # The raw bytes of the training matrix must not appear, neither directly
+    # nor through the per-column statistics that a careless export would keep.
+    raw = np.ascontiguousarray(X).tobytes()
+    assert base64.b64encode(raw).decode() not in payload
+    assert "X_train_" not in payload
+    assert "X_fit_" not in payload
+    # What is stored are only learned parameters.
+    assert "mean_" in payload  # StandardScaler.mean_ is a parameter
+    assert all(np.asarray(X[0]) != np.asarray(X[1]))
+
+
+def test_chain_state_refuses_to_embed_kept_training_data(tmp_path):
+    from sklearn.exceptions import ChainStateDataError
+    from sklearn.impute import KNNImputer
+
+    X, _ = make_classification(n_samples=40, n_features=4, random_state=0)
+    X = X.copy()
+    X[::5, 0] = np.nan
+    pipe = Pipeline([("imputer", KNNImputer()), ("scaler", StandardScaler())]).fit(X)
+    path = tmp_path / "state.jsonl"
+
+    summary = pipe.export_chain_state(path)
+    assert summary["steps"][0]["non_exclusive"] == ["_fit_X", "_mask_fit_X"]
+    assert base64.b64encode(np.ascontiguousarray(X).tobytes()).decode() not in (
+        path.read_text()
+    )
+    with pytest.raises(ChainStateDataError, match="training data"):
+        Pipeline.load_chain_state(path)
+
+
+def test_replay_chain_state_same_machine(tmp_path):
+    """Acceptance case 1: replay on the machine that exported the state."""
+    X, y = make_classification(n_samples=60, n_features=5, random_state=0)
+    pipe = _chain_state_pipeline().fit(X, y)
+    path = tmp_path / "state.jsonl"
+    pipe.export_chain_state(path)
+
+    report = pipe.replay_chain_state(path, X)
+
+    # acceptance assertion: the replay equals the original within tolerance
+    assert report["equal"] is True
+    assert report["exact"] is True
+    assert report["first_divergent_step"] is None
+    assert report["rtol"] > 0 and report["atol"] > 0
+    for step in report["steps"]:
+        assert step["max_abs_diff"] == 0.0 or step["max_abs_diff"] is None
+        assert step["exact"] is True
+
+
+def test_replay_chain_state_cross_machine(tmp_path):
+    """Acceptance case 2: the document is read back in a fresh process.
+
+    A separate interpreter guarantees that no in-memory state of the exporting
+    process can leak into the replay.
+    """
+    X, y = make_classification(n_samples=60, n_features=5, random_state=0)
+    pipe = _chain_state_pipeline().fit(X, y)
+    path = tmp_path / "state.jsonl"
+    original = pipe.predict_proba(X)
+    pipe.export_chain_state(path)
+    np.save(tmp_path / "X.npy", X)
+    np.save(tmp_path / "original.npy", original)
+
+    script = textwrap.dedent(
+        f"""
+        import numpy as np
+        from sklearn.pipeline import Pipeline
+        X = np.load({str(tmp_path / "X.npy")!r})
+        original = np.load({str(tmp_path / "original.npy")!r})
+        restored = Pipeline.load_chain_state({str(path)!r})
+        replayed = restored.predict_proba(X)
+        print("equal", np.array_equal(original, replayed))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == "equal True"
+
+
+def test_diff_chain_state_locates_replaced_step(tmp_path):
+    """Acceptance case 3: replacing one step names that step."""
+    X, y = make_classification(n_samples=60, n_features=5, random_state=0)
+    pipe = _chain_state_pipeline().fit(X, y)
+    path = tmp_path / "before.jsonl"
+    pipe.export_chain_state(path)
+
+    # Same chain, one sub-transformer replaced by another algorithm.
+    from sklearn.preprocessing import MinMaxScaler
+
+    modified = _chain_state_pipeline()
+    modified.set_params(prep__num=MinMaxScaler())
+    modified.fit(X, y)
+    modified_path = tmp_path / "after.jsonl"
+    modified.export_chain_state(modified_path)
+
+    report = modified.diff_chain_state(path)
+
+    assert report["identical"] is False
+    assert report["first_changed_step"] == "prep"
+    # the individual transformer is named, not just the enclosing step
+    assert report["first_changed_component"] == "prep.transformers_[0].num"
+    changes = [
+        entry
+        for entry in report["entries"]
+        if entry["kind"] == "class_changed" and "transformers_[0].num" in entry["path"]
+    ]
+    assert len(changes) == 1
+    assert changes[0]["old"].endswith(":StandardScaler")
+    assert changes[0]["new"].endswith(":MinMaxScaler")
+    # the downstream estimator is reported as changed too, since it was refit
+    assert "clf" in report["changed_steps"]
+
+
+def test_diff_chain_state_locates_changed_parameter(tmp_path):
+    X, y = make_classification(n_samples=60, n_features=5, random_state=0)
+    pipe = _chain_state_pipeline().fit(X, y)
+    path = tmp_path / "before.jsonl"
+    pipe.export_chain_state(path)
+
+    modified = _chain_state_pipeline()
+    modified.set_params(prep__num__with_std=False)
+    modified.fit(X, y)
+
+    report = modified.diff_chain_state(path)
+
+    assert report["first_changed_step"] == "prep"
+    assert report["first_changed_component"] == "prep.transformers_[0].num"
+    parameter_changes = [
+        entry for entry in report["entries"] if entry["path"].endswith("with_std.value")
+    ]
+    # the parameter is recorded both in the step itself and in its component
+    assert parameter_changes
+    assert all(
+        entry["old"] == "True" and entry["new"] == "False"
+        for entry in parameter_changes
+    )
+
+
+def test_diff_chain_state_identical(tmp_path):
+    X, y = make_classification(n_samples=60, n_features=5, random_state=0)
+    pipe = _chain_state_pipeline().fit(X, y)
+    path = tmp_path / "state.jsonl"
+    pipe.export_chain_state(path)
+
+    report = pipe.diff_chain_state(path)
+
+    assert report["identical"] is True
+    assert report["changed_steps"] == []
+    assert report["first_changed_step"] is None
+
+
+@pytest.mark.parametrize("n_jobs", [1, 2])
+def test_chain_state_is_stable_under_parallelism(tmp_path, n_jobs):
+    """Acceptance case 4: parallel fit and parallel steps replay identically."""
+    X, y = make_classification(n_samples=80, n_features=5, random_state=0)
+    pipe = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "clf",
+                RandomForestClassifier(n_estimators=5, random_state=0, n_jobs=n_jobs),
+            ),
+        ]
+    ).fit(X, y)
+    path = tmp_path / f"state-{n_jobs}.jsonl"
+
+    pipe.export_chain_state(path)
+    report = pipe.replay_chain_state(path, X)
+
+    assert report["equal"] is True
+    assert report["exact"] is True
+
+
+def test_chain_state_corruption_is_located(tmp_path):
+    from sklearn.exceptions import ChainStateCorruptionError
+
+    X, y = make_classification(n_samples=60, n_features=5, random_state=0)
+    pipe = _chain_state_pipeline().fit(X, y)
+    path = tmp_path / "state.jsonl"
+    pipe.export_chain_state(path)
+    lines = path.read_text().splitlines()
+
+    # Corrupt the second step: its own checksum must catch it.
+    lines[2] = lines[2].replace('"data":"', '"data":"AA', 1)
+    corrupted = tmp_path / "corrupted.jsonl"
+    corrupted.write_text("\n".join(lines) + "\n")
+
+    with pytest.raises(ChainStateCorruptionError) as excinfo:
+        Pipeline.load_chain_state(corrupted)
+    message = str(excinfo.value)
+    # the faulty segment is named, not just "something is wrong"
+    assert "line 3" in message
+    assert "clf" in message
+    assert "checksum mismatch" in message
+
+
+def test_chain_state_truncation_is_located(tmp_path):
+    from sklearn.exceptions import ChainStateCorruptionError
+
+    X, y = make_classification(n_samples=60, n_features=5, random_state=0)
+    pipe = _chain_state_pipeline().fit(X, y)
+    path = tmp_path / "state.jsonl"
+    pipe.export_chain_state(path)
+    lines = path.read_text().splitlines()
+
+    truncated = tmp_path / "truncated.jsonl"
+    truncated.write_text("\n".join(lines[:-1]) + "\n")
+
+    with pytest.raises(ChainStateCorruptionError) as excinfo:
+        Pipeline.load_chain_state(truncated)
+    assert "without an end segment" in str(excinfo.value)
+
+
+def test_chain_state_incompatible_version(tmp_path):
+    from sklearn.exceptions import ChainStateVersionError
+
+    X, y = make_classification(n_samples=60, n_features=5, random_state=0)
+    pipe = Pipeline([("scaler", StandardScaler())]).fit(X)
+    path = tmp_path / "state.jsonl"
+    pipe.export_chain_state(path)
+
+    from sklearn.utils import _chain_state
+
+    header, *rest = path.read_text().splitlines()
+    header = json.loads(header)
+    header = {key: value for key, value in header.items() if key != "sha256"}
+    header["format_version"] = [2, 0]
+    rehashed = _chain_state._checked(header)
+    incompatible = tmp_path / "incompatible.jsonl"
+    incompatible.write_text(
+        _chain_state._line(rehashed) + "\n" + "\n".join(rest) + "\n"
+    )
+
+    with pytest.raises(ChainStateVersionError, match="format version 2.0"):
+        Pipeline.load_chain_state(incompatible)
+
+
+def test_chain_state_unsupported_step_suggests_migration(tmp_path):
+    from sklearn.exceptions import ChainStateMigrationError
+
+    X, y = make_classification(n_samples=60, n_features=5, random_state=0)
+    pipe = Pipeline([("scaler", StandardScaler())]).fit(X)
+    path = tmp_path / "state.jsonl"
+    pipe.export_chain_state(path)
+
+    from sklearn.utils import _chain_state
+
+    header, *rest = path.read_text().splitlines()
+    step = json.loads(rest[0])
+    step = {key: value for key, value in step.items() if key != "sha256"}
+    step["class"] = "sklearn.preprocessing._data:GoneScaler"
+    with pytest.raises(ChainStateMigrationError) as excinfo:
+        _chain_state.build_pipeline(
+            json.loads(header),
+            [_chain_state._checked(step)],
+            pipeline_class=Pipeline,
+        )
+    assert excinfo.value.fragment.endswith("GoneScaler")
+    assert "renamed or removed" in excinfo.value.suggestion
+
+
+def test_chain_state_unsupported_parameter_suggests_migration(tmp_path):
+    """A parameter that still exists but no longer accepts the old value."""
+    from sklearn.exceptions import ChainStateMigrationError
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.utils import _chain_state
+
+    X, y = make_classification(n_samples=40, n_features=4, random_state=0)
+    pipe = Pipeline([("clf", LogisticRegression(max_iter=100))]).fit(X, y)
+    path = tmp_path / "state.jsonl"
+    pipe.export_chain_state(path)
+
+    header, *rest = path.read_text().splitlines()
+    step = json.loads(rest[0])
+    step = {key: value for key, value in step.items() if key != "sha256"}
+    step["params"]["solver"] = "not_a_solver"
+    with pytest.raises(ChainStateMigrationError) as excinfo:
+        _chain_state.build_pipeline(
+            json.loads(header),
+            [_chain_state._checked(step)],
+            pipeline_class=Pipeline,
+        )
+    assert "solver" in str(excinfo.value)
+    assert "closest supported value" in excinfo.value.suggestion
+
+
+def test_chain_state_failed_write_leaves_no_partial_file(tmp_path, monkeypatch):
+    X, _ = make_classification(n_samples=40, n_features=4, random_state=0)
+    pipe = Pipeline([("scaler", StandardScaler())]).fit(X)
+    path = tmp_path / "state.jsonl"
+
+    from sklearn.utils import _chain_state
+
+    def broken_dump(header, records, fileobj):
+        fileobj.write("{}\n")
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(_chain_state, "dump_state", broken_dump)
+    with pytest.raises(RuntimeError, match="disk full"):
+        pipe.export_chain_state(path)
+    assert not path.exists()
+    # no temporary file is left behind either
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_chain_state_does_not_change_existing_behaviour(tmp_path):
+    """Exporting, replaying and diffing leave the pipeline untouched."""
+    import pickle
+
+    X, y = make_classification(n_samples=60, n_features=5, random_state=0)
+    pipe = _chain_state_pipeline().fit(X, y)
+    before = pickle.dumps(pipe)
+    predictions = pipe.predict(X).copy()
+
+    path = tmp_path / "state.jsonl"
+    pipe.export_chain_state(path)
+    pipe.replay_chain_state(path, X)
+    pipe.diff_chain_state(path)
+
+    assert pickle.dumps(pipe) == before
+    assert np.array_equal(pipe.predict(X), predictions)
+
+
+def test_chain_state_streaming_many_steps(tmp_path):
+    """A long chain is exported and read one segment at a time."""
+    from sklearn.utils import _chain_state
+
+    X, y = load_iris(return_X_y=True)
+    steps = [(f"scaler{i}", StandardScaler()) for i in range(120)]
+    steps.append(("clf", LogisticRegression(max_iter=1000)))
+    pipe = Pipeline(steps).fit(X, y)
+    path = tmp_path / "long.jsonl"
+
+    summary = pipe.export_chain_state(path)
+    assert summary["n_steps"] == 121
+
+    # reading never holds more than the current segment in memory
+    segments = list(_chain_state.iter_state(path))
+    assert len(segments) == 121 + 2  # header + 121 steps + end
+
+    report = pipe.replay_chain_state(path, X)
+    assert report["equal"] is True

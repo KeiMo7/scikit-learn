@@ -1,0 +1,13 @@
+- :class:`pipeline.Pipeline` gains :meth:`pipeline.Pipeline.export_chain_state`,
+  :meth:`pipeline.Pipeline.load_chain_state`,
+  :meth:`pipeline.Pipeline.replay_chain_state` and
+  :meth:`pipeline.Pipeline.diff_chain_state`. They record the fitted state of a
+  chain (step classes and parameters, learned attributes, input/output
+  dimensionality, dependency order and the seeds each step consumed) in a
+  checksummed, streaming JSON Lines document that excludes the training data,
+  restore it bit-for-bit without re-fitting, verify that a replay reproduces
+  the original outputs within an explicit ``(rtol, atol)`` tolerance, and name
+  the step responsible for a difference. The four new errors derive from
+  :class:`exceptions.ChainStateError`. Existing behaviour is unchanged: the
+  state is only produced when one of the new methods is called.
+  By :user:`KeiMo7 <KeiMo7>`.

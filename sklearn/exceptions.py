@@ -4,6 +4,12 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 __all__ = [
+    "ChainStateCorruptionError",
+    "ChainStateDataError",
+    "ChainStateError",
+    "ChainStateMigrationError",
+    "ChainStateUnsupportedStepError",
+    "ChainStateVersionError",
     "ConvergenceWarning",
     "DataConversionWarning",
     "DataDimensionalityWarning",
@@ -41,6 +47,144 @@ class UnsetMetadataPassedError(ValueError):
         super().__init__(message)
         self.unrequested_params = unrequested_params
         self.routed_params = routed_params
+
+
+class ChainStateError(ValueError):
+    """Base class for errors raised when exporting, reading or replaying the \
+    state of a pipeline.
+
+    Every error carries the part of the document it concerns and a concrete
+    suggestion, so that a failure can be acted upon without inspecting the
+    source of scikit-learn.
+
+    Parameters
+    ----------
+    message : str
+        Human readable explanation of the failure.
+
+    fragment : str or None, default=None
+        Identifier of the failing part of the document, for instance
+        ``"step 2 (scaler)"``. ``None`` when the problem concerns the whole
+        document.
+
+    suggestion : str or None, default=None
+        Concrete action that is likely to fix the problem.
+
+    Attributes
+    ----------
+    message : str
+        The message passed at construction.
+
+    fragment : str or None
+        The failing fragment, if any.
+
+    suggestion : str or None
+        The suggested action, if any.
+
+    Examples
+    --------
+    >>> from sklearn.exceptions import ChainStateCorruptionError
+    >>> error = ChainStateCorruptionError(
+    ...     "checksum mismatch", fragment="step 2 (scaler)",
+    ...     suggestion="Re-export the state.")
+    >>> print(error)  # doctest: +NORMALIZE_WHITESPACE
+    [step 2 (scaler)] checksum mismatch
+    Hint: Re-export the state.
+    """
+
+    def __init__(self, message, *, fragment=None, suggestion=None):
+        self.message = message
+        self.fragment = fragment
+        self.suggestion = suggestion
+        full = message
+        if fragment is not None:
+            full = f"[{fragment}] {full}"
+        if suggestion is not None:
+            full = f"{full}\nHint: {suggestion}"
+        super().__init__(full)
+
+
+class ChainStateVersionError(ChainStateError):
+    """The state document was written by an incompatible format version.
+
+    Parameters
+    ----------
+    message : str
+        Human readable explanation of the failure.
+
+    fragment : str or None, default=None
+        Identifier of the failing part of the document.
+
+    suggestion : str or None, default=None
+        Concrete action that is likely to fix the problem.
+    """
+
+
+class ChainStateCorruptionError(ChainStateError):
+    """The state document is truncated, malformed or fails its checksum.
+
+    Parameters
+    ----------
+    message : str
+        Human readable explanation of the failure.
+
+    fragment : str or None, default=None
+        Identifier of the failing part of the document.
+
+    suggestion : str or None, default=None
+        Concrete action that is likely to fix the problem.
+    """
+
+
+class ChainStateDataError(ChainStateError):
+    """A step cannot be restored because its state was not exported.
+
+    This happens for estimators that keep a copy of the training data in their
+    fitted attributes: that copy is deliberately left out of the document.
+
+    Parameters
+    ----------
+    message : str
+        Human readable explanation of the failure.
+
+    fragment : str or None, default=None
+        Identifier of the failing part of the document.
+
+    suggestion : str or None, default=None
+        Concrete action that is likely to fix the problem.
+    """
+
+
+class ChainStateMigrationError(ChainStateError):
+    """A recorded step is not supported by the current version.
+
+    Parameters
+    ----------
+    message : str
+        Human readable explanation of the failure.
+
+    fragment : str or None, default=None
+        Identifier of the failing part of the document.
+
+    suggestion : str or None, default=None
+        Concrete action that is likely to fix the problem.
+    """
+
+
+class ChainStateUnsupportedStepError(ChainStateError):
+    """A step cannot be described without exporting data or unpicklable state.
+
+    Parameters
+    ----------
+    message : str
+        Human readable explanation of the failure.
+
+    fragment : str or None, default=None
+        Identifier of the failing part of the document.
+
+    suggestion : str or None, default=None
+        Concrete action that is likely to fix the problem.
+    """
 
 
 class NotFittedError(ValueError, AttributeError):

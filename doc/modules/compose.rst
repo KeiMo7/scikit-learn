@@ -274,6 +274,98 @@ object::
 
 * :ref:`sphx_glr_auto_examples_compose_plot_compare_reduction.py`
 
+.. _pipeline_chain_state:
+
+Exporting and replaying the state of a chain
+--------------------------------------------
+
+.. currentmodule:: sklearn.pipeline
+
+Two runs of the same script on the same data can give slightly different
+metrics when the chain itself is not the same, for instance because a
+transformer was replaced or because a step was applied in a different order.
+When this happens, reading the code is not enough: the chain must be described
+by something that can be compared and replayed.
+
+:meth:`Pipeline.export_chain_state` writes such a description. For each step it
+records the class, the constructor parameters, the attributes learned during
+``fit``, the input and output dimensionality, the step it depends on and the
+randomness it consumed. The training data is never written; a step that keeps
+a copy of it (for instance :class:`~sklearn.impute.KNNImputer`) is flagged, and
+loading such a document raises :class:`~sklearn.exceptions.ChainStateDataError`
+instead of silently embedding the data.
+
+::
+
+    >>> from sklearn.datasets import load_iris
+    >>> from sklearn.linear_model import LogisticRegression
+    >>> from sklearn.pipeline import Pipeline
+    >>> from sklearn.preprocessing import StandardScaler
+    >>> X, y = load_iris(return_X_y=True)
+    >>> pipe = Pipeline([("scaler", StandardScaler()),
+    ...                  ("clf", LogisticRegression(max_iter=1000))]).fit(X, y)
+    >>> summary = pipe.export_chain_state("chain.jsonl")
+    >>> [step["name"] for step in summary["steps"]]
+    ['scaler', 'clf']
+
+The document stores arrays as exact bytes, so :meth:`Pipeline.load_chain_state`
+rebuilds the fitted chain without calling ``fit`` and reproduces the same
+predictions on any machine::
+
+    >>> restored = Pipeline.load_chain_state("chain.jsonl")
+    >>> bool((restored.predict(X) == pipe.predict(X)).all())
+    True
+
+:meth:`Pipeline.replay_chain_state` performs that comparison step by step and
+reports the first step whose output differs. The comparison uses the explicit
+``(rtol, atol)`` pair recorded in the document unless another one is given, and
+reports both ``equal`` (within the tolerance) and ``exact`` (bit for bit)::
+
+    >>> report = pipe.replay_chain_state("chain.jsonl", X)
+    >>> report["equal"], report["exact"], report["first_divergent_step"]
+    (True, True, None)
+
+When the chain was modified, :meth:`Pipeline.diff_chain_state` compares two
+documents and names the responsible step. For a composite step such as
+:class:`~sklearn.compose.ColumnTransformer` it reports the individual
+transformer::
+
+    >>> _ = pipe.export_chain_state("before.jsonl")
+    >>> pipe.set_params(scaler__with_std=False).fit(X, y)
+    Pipeline(steps=[('scaler', StandardScaler(with_std=False)),
+                    ('clf', LogisticRegression(max_iter=1000))])
+    >>> report = pipe.diff_chain_state("before.jsonl")
+    >>> report["first_changed_step"]
+    'scaler'
+
+A corrupted or truncated document is rejected with
+:class:`~sklearn.exceptions.ChainStateCorruptionError`, which names the faulty
+segment (for instance ``"[line 3, step 1 (clf)] checksum mismatch"``). A step
+that the current version cannot build raises
+:class:`~sklearn.exceptions.ChainStateMigrationError` with a migration hint.
+Documents are written atomically, so a failed export leaves no partial file.
+
+.. dropdown:: Randomness in the exported state
+
+  The ``randomness`` entry of each step makes the sources of randomness
+  explicit. ``seeded`` states whether the step has a seed parameter,
+  ``seed_params`` lists those parameters with their values, and ``derived``
+  records the seeds the estimator computed from them (for instance
+  ``_random_seed`` and a digest of the state of the generator used for feature
+  subsampling). The ``random_state`` of a step is passed to ``fit`` unchanged,
+  which is what makes a re-fit of an unmodified chain reproducible.
+
+.. dropdown:: Document format
+
+  The document is a JSON Lines stream: a header, one line per step, then a
+  footer. Each line carries its own SHA-256 checksum, and the footer records a
+  digest of every step, which is what makes it possible to name the exact
+  segment that was modified. Steps are written and read one at a time, so a
+  chain with hundreds of steps does not need to fit in memory. The header
+  stores the format version; a document written by an unsupported version is
+  rejected with :class:`~sklearn.exceptions.ChainStateVersionError` rather than
+  being misinterpreted.
+
 .. _transformed_target_regressor:
 
 Transforming target in regression

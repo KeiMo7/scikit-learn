@@ -398,6 +398,11 @@ API_REFERENCE = {
             {
                 "title": None,
                 "autosummary": [
+                    "ChainStateCorruptionError",
+                    "ChainStateDataError",
+                    "ChainStateError",
+                    "ChainStateMigrationError",
+                    "ChainStateVersionError",
                     "ConvergenceWarning",
                     "DataConversionWarning",
                     "DataDimensionalityWarning",

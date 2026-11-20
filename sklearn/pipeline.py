@@ -1356,6 +1356,314 @@ class Pipeline(CallbackSupportMixin, _BaseComposition):
             dash_wrapped=False,
         )
 
+    def export_chain_state(self, path):
+        """Export the state of the fitted chain to ``path``.
+
+        The exported document records, for each step, the estimator class, its
+        constructor parameters, the attributes learned during ``fit``, the
+        input/output dimensionality, the step it depends on and the randomness
+        it consumed.  The training data itself is never written: steps that
+        keep a copy of it (for instance :class:`~sklearn.impute.KNNImputer`)
+        are flagged, and such a chain can only be replayed by re-fitting those
+        steps on the caller's data.
+
+        The result can be loaded on another machine with
+        :meth:`load_chain_state` and replayed with :meth:`replay_chain_state`.
+        The parameters of the chain are stored as exact bytes, so a replay
+        reproduces the original predictions bit for bit, without calling
+        ``fit`` again.
+
+        This method does not change the fitted pipeline and is not called by
+        ``fit``, ``predict`` or any other existing method: exporting the state
+        is purely opt-in.
+
+        Parameters
+        ----------
+        path : str or path-like
+            Destination file. It is written atomically: either the complete
+            document is created, or the file is left untouched.
+
+        Returns
+        -------
+        summary : dict
+            A JSON-able description of what was written: the format version,
+            the list of steps with their class, dimensionality, dependency and
+            the parameters that make them depend on a seed.
+
+        See Also
+        --------
+        load_chain_state : Load an exported document.
+        replay_chain_state : Check that a replay reproduces the original outputs.
+        diff_chain_state : Locate the step responsible for a difference.
+
+        Examples
+        --------
+        >>> from sklearn.preprocessing import StandardScaler
+        >>> from sklearn.linear_model import LogisticRegression
+        >>> from sklearn.datasets import load_iris
+        >>> from sklearn.pipeline import Pipeline
+        >>> X, y = load_iris(return_X_y=True)
+        >>> pipe = Pipeline([("scaler", StandardScaler()),
+        ...                  ("clf", LogisticRegression(max_iter=1000))]).fit(X, y)
+        >>> summary = pipe.export_chain_state("chain.jsonl")
+        >>> summary["n_steps"]
+        2
+        >>> summary["steps"][0]["class"]
+        'sklearn.preprocessing._data:StandardScaler'
+        """
+        from sklearn.utils import _chain_state
+
+        check_is_fitted(self)
+        header = _chain_state.export_header(self, pipeline_class=type(self))
+        # Steps are produced lazily while the document is written, so a chain
+        # with hundreds of steps is exported with bounded memory.  Only the
+        # lightweight per-step summaries are kept for the return value.
+        collected = []
+        _chain_state.save_state(
+            header, _chain_state.iter_records(self, collected=collected), path
+        )
+        return _chain_state.summary(header, collected)
+
+    @classmethod
+    def load_chain_state(cls, path):
+        """Load a fitted pipeline from a document written by \
+:meth:`export_chain_state`.
+
+        The returned pipeline is fitted: its steps hold the exact parameters
+        and learned attributes recorded in the document, and ``predict`` and
+        ``transform`` can be called on it directly.  ``fit`` is never called.
+
+        Parameters
+        ----------
+        path : str or path-like
+            Document written by :meth:`export_chain_state`.
+
+        Returns
+        -------
+        pipeline : Pipeline
+            A fitted pipeline equivalent to the one that was exported.
+
+        Raises
+        ------
+        ChainStateVersionError
+            If the document was written by an incompatible format version.
+
+        ChainStateCorruptionError
+            If the document is truncated, malformed, or fails a checksum.  The
+            error message names the faulty segment.
+
+        ChainStateMigrationError
+            If a recorded step refers to a class, parameter or fitted attribute
+            that the current version no longer supports.  The error message
+            contains a migration hint.
+
+        ChainStateDataError
+            If a step could not be recorded because it keeps a copy of the
+            training data.
+
+        See Also
+        --------
+        export_chain_state : Write the document.
+        replay_chain_state : Check that a replay reproduces the original outputs.
+
+        Examples
+        --------
+        >>> from sklearn.preprocessing import StandardScaler
+        >>> from sklearn.linear_model import LogisticRegression
+        >>> from sklearn.datasets import load_iris
+        >>> from sklearn.pipeline import Pipeline
+        >>> X, y = load_iris(return_X_y=True)
+        >>> pipe = Pipeline([("scaler", StandardScaler()),
+        ...                  ("clf", LogisticRegression(max_iter=1000))]).fit(X, y)
+        >>> _ = pipe.export_chain_state("chain.jsonl")
+        >>> restored = Pipeline.load_chain_state("chain.jsonl")
+        >>> bool((restored.predict(X) == pipe.predict(X)).all())
+        True
+        """
+        from sklearn.utils import _chain_state
+
+        header, records = _chain_state.read_state(path)
+        return _chain_state.build_pipeline(header, records, pipeline_class=cls)
+
+    def replay_chain_state(self, path, X, *, rtol=None, atol=None):
+        """Replay an exported state and compare the result with this pipeline.
+
+        The pipeline recorded in ``path`` is loaded without calling ``fit``,
+        and both chains are run on ``X``.  The output of every intermediate
+        step, and the output of the final estimator, are compared.  The
+        comparison uses the tolerance stored in the document unless ``rtol``
+        or ``atol`` is given.  A comparison is *exact* when the two outputs are
+        bit-for-bit identical, which is the expected outcome on any machine for
+        an unmodified chain, and the report states it explicitly.
+
+        Parameters
+        ----------
+        path : str or path-like
+            Document written by :meth:`export_chain_state`.
+
+        X : array-like
+            Data to run both chains on.  The same input is used for the two
+            chains, so any difference reported comes from the chain itself.
+
+        rtol : float or None, default=None
+            Relative tolerance. ``None`` uses the value recorded in the
+            document.
+
+        atol : float or None, default=None
+            Absolute tolerance. ``None`` uses the value recorded in the
+            document.
+
+        Returns
+        -------
+        report : dict
+            With the following keys:
+
+            ``equal`` : bool
+                Whether every step and the final output agree within the
+                tolerance.
+
+            ``exact`` : bool
+                Whether every compared array is bit-for-bit identical.
+
+            ``first_divergent_step`` : str or None
+                Name of the first step whose output differs, ``"<final>"`` for
+                the final estimator, or ``None`` when everything agrees.
+
+            ``steps`` : list of dict
+                One entry per compared step, with the step name, whether it is
+                ``equal`` and ``exact``, and the maximum absolute difference.
+
+            ``rtol``, ``atol`` : float
+                The tolerances that were used.
+
+        See Also
+        --------
+        export_chain_state : Write the document.
+        load_chain_state : Load the document without comparing.
+        diff_chain_state : Compare documents instead of outputs.
+
+        Examples
+        --------
+        >>> from sklearn.preprocessing import StandardScaler
+        >>> from sklearn.linear_model import LogisticRegression
+        >>> from sklearn.datasets import load_iris
+        >>> from sklearn.pipeline import Pipeline
+        >>> X, y = load_iris(return_X_y=True)
+        >>> pipe = Pipeline([("scaler", StandardScaler()),
+        ...                  ("clf", LogisticRegression(max_iter=1000))]).fit(X, y)
+        >>> _ = pipe.export_chain_state("chain.jsonl")
+        >>> report = pipe.replay_chain_state("chain.jsonl", X)
+        >>> report["equal"], report["first_divergent_step"]
+        (True, None)
+        """
+        from sklearn.utils import _chain_state
+
+        check_is_fitted(self)
+        header, records = _chain_state.read_state(path)
+        replayed = _chain_state.build_pipeline(
+            header, records, pipeline_class=type(self)
+        )
+        tolerance = header.get("tolerance", {})
+        if rtol is None:
+            rtol = tolerance.get("rtol", _chain_state.DEFAULT_RTOL)
+        if atol is None:
+            atol = tolerance.get("atol", _chain_state.DEFAULT_ATOL)
+        report = _chain_state.replay_steps(self, replayed, X, rtol=rtol, atol=atol)
+        report["exact"] = report["equal"] and all(
+            step.get("exact", step["equal"]) for step in report["steps"]
+        )
+        return report
+
+    def diff_chain_state(self, path, other=None):
+        """Locate the steps that differ between two chain states.
+
+        This compares the *structure* of two chains rather than their outputs,
+        so it answers "which step was changed?" directly.  It is the right tool
+        when a replay of a modified chain gives different numbers and the step
+        responsible must be named.
+
+        Parameters
+        ----------
+        path : str or path-like
+            Document written by :meth:`export_chain_state`.
+
+        other : str, path-like or Pipeline, default=None
+            What to compare with.  It can be another document, a fitted
+            :class:`Pipeline` (whose state is exported in memory, without
+            touching the disk or the pipeline itself), or ``None`` to compare
+            ``path`` with the state of this pipeline.
+
+        Returns
+        -------
+        report : dict
+            With the following keys:
+
+            ``identical`` : bool
+                Whether the two documents describe the same chain.
+
+            ``changed_steps`` : list of str
+                Names of the top-level steps that differ, in execution order.
+
+            ``first_changed_step`` : str or None
+                The first changed top-level step, i.e. the earliest point in the
+                chain where the two documents diverge.
+
+            ``first_changed_component`` : str or None
+                The first changed sub-estimator, for composite steps.  For a
+                :class:`~sklearn.compose.ColumnTransformer` this points at the
+                individual transformer, e.g.
+                ``"prep.transformers_[0].num"``.
+
+            ``steps`` : list of dict
+                One entry per step, with its status (``"identical"``,
+                ``"changed"``, ``"added"`` or ``"removed"``), the changed
+                fields and the changed sub-estimators.
+
+            ``entries`` : list of dict
+                The individual differences, each with the path it was found at
+                and the old and new values.
+
+        See Also
+        --------
+        export_chain_state : Write a document.
+        replay_chain_state : Compare outputs instead of structure.
+
+        Examples
+        --------
+        >>> from sklearn.preprocessing import StandardScaler
+        >>> from sklearn.linear_model import LogisticRegression
+        >>> from sklearn.datasets import load_iris
+        >>> from sklearn.pipeline import Pipeline
+        >>> X, y = load_iris(return_X_y=True)
+        >>> pipe = Pipeline([("scaler", StandardScaler()),
+        ...                  ("clf", LogisticRegression(max_iter=1000))]).fit(X, y)
+        >>> _ = pipe.export_chain_state("a.jsonl")
+        >>> pipe.set_params(scaler__with_std=False).fit(X, y)
+        Pipeline(steps=[('scaler', StandardScaler(with_std=False)),
+                        ('clf', LogisticRegression(max_iter=1000))])
+        >>> report = pipe.diff_chain_state("a.jsonl")
+        >>> report["changed_steps"]
+        ['scaler', 'clf']
+        >>> report["first_changed_step"]
+        'scaler'
+        """
+        from sklearn.utils import _chain_state
+
+        if other is None:
+            reference = _chain_state.export_state(self, pipeline_class=type(self))
+        elif isinstance(other, (str, bytes)) or hasattr(other, "__fspath__"):
+            reference = _chain_state.read_state(other)
+        elif isinstance(other, Pipeline):
+            reference = _chain_state.export_state(other, pipeline_class=type(other))
+        else:
+            raise TypeError(
+                f"other must be a path, a Pipeline or None, got {type(other).__name__}"
+            )
+        target = _chain_state.read_state(path)
+        # ``path`` is the baseline (old), ``other`` the state to compare with
+        # (new): the report then reads "the step went from A to B".
+        return _chain_state.diff_states(*target, *reference)
+
     def get_metadata_routing(self):
         """Get metadata routing of this object.
 
