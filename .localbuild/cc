@@ -1,0 +1,7 @@
+#!/bin/sh
+# Wrapper around zig cc: host python dev headers live under /home/wll/pyinclude
+# and only a versioned libpython soname is available.
+exec python -m ziglang cc \
+  -I/home/wll/pyinclude \
+  -I/home/wll/pyinclude/python3.14 \
+  "$@"

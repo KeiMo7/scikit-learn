@@ -265,6 +265,13 @@ class BaseSuccessiveHalving(BaseSearchCV):
         self : object
             Instance of fitted estimator.
         """
+        if getattr(self, "checkpoint", None) is not None:
+            raise NotImplementedError(
+                "Staged, resumable search (the `checkpoint` parameter) is not "
+                "supported by successive-halving searches, whose adaptive "
+                "candidate schedule cannot be resumed stage by stage. Use "
+                "GridSearchCV or RandomizedSearchCV instead."
+            )
         self._n_samples_orig = _num_samples(X)
 
         super().fit(X, y=y, **params)

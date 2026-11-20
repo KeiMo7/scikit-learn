@@ -4,6 +4,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 __all__ = [
+    "CheckpointCorruptedError",
+    "CheckpointCorruptedWarning",
+    "CheckpointMismatchError",
     "ConvergenceWarning",
     "DataConversionWarning",
     "DataDimensionalityWarning",
@@ -223,3 +226,32 @@ class EstimatorCheckFailedWarning(UserWarning):
 
     def __str__(self):
         return self.__repr__()
+
+
+class CheckpointMismatchError(ValueError):
+    """Exception class to raise when resuming from an incompatible checkpoint.
+
+    This is raised when the data, random seed, cross-validation splits or
+    scoring configuration of a new search do not match the ones recorded in
+    an existing checkpoint, because mixing evaluations from two different
+    configurations would produce incomparable results.
+
+    .. versionadded:: 1.10
+    """
+
+
+class CheckpointCorruptedError(IOError):
+    """Exception class to raise when a checkpoint cannot be read or recovered.
+
+    .. versionadded:: 1.10
+    """
+
+
+class CheckpointCorruptedWarning(UserWarning):
+    """Warning used when a corrupted checkpoint segment is partially salvaged.
+
+    The intact prefix of the damaged segment is kept; evaluations that could
+    not be recovered are re-run when the search resumes.
+
+    .. versionadded:: 1.10
+    """

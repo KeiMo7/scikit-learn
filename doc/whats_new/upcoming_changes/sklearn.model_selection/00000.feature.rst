@@ -1,0 +1,9 @@
+- :class:`model_selection.GridSearchCV` and
+  :class:`model_selection.RandomizedSearchCV` accept two new parameters,
+  `stage_size` and `checkpoint`, to run searches in resumable stages. Setting
+  `checkpoint` to a directory persists every evaluated candidate atomically to
+  disk: an interrupted or restarted search reuses previously evaluated
+  candidates instead of re-running them, enlarging the candidate space between
+  runs keeps existing evaluations, and changes to the data, random seed,
+  cross-validation splits or scoring are detected and refused. With both
+  parameters left at their default the behaviour is unchanged.

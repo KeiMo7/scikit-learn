@@ -1,0 +1,5 @@
+#!/bin/sh
+exec python -m ziglang c++ \
+  -I/home/wll/pyinclude \
+  -I/home/wll/pyinclude/python3.14 \
+  "$@"

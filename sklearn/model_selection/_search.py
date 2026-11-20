@@ -8,6 +8,7 @@ parameters of an estimator.
 
 import numbers
 import operator
+import os
 import re
 import time
 import warnings
@@ -31,12 +32,17 @@ from sklearn.base import (
     is_classifier,
 )
 from sklearn.callback import CallbackSupportMixin
-from sklearn.exceptions import NotFittedError
+from sklearn.exceptions import CheckpointMismatchError, NotFittedError
 from sklearn.metrics import check_scoring
 from sklearn.metrics._scorer import (
     _check_multimetric_scoring,
     _MultimetricScorer,
     get_scorer_names,
+)
+from sklearn.model_selection._checkpoint import (
+    SearchCheckpoint,
+    candidate_key,
+    make_search_fingerprint,
 )
 from sklearn.model_selection._split import check_cv
 from sklearn.model_selection._validation import (
@@ -356,6 +362,29 @@ class ParameterSampler:
             return self.n_iter
 
 
+def _mean_test_score(per_split_out, refit_metric):
+    """Mean test score of one candidate across its CV splits.
+
+    Mirrors the ranking metric used by ``_select_best_index``: for a single
+    scorer the value is stored directly, otherwise the refit metric is picked
+    out of the per-split score dictionaries. NaN means are kept as NaN.
+    """
+    scores = [entry["test_scores"] for entry in per_split_out]
+    if isinstance(scores[0], dict):
+        values = [score[refit_metric] for score in scores]
+    else:
+        values = scores
+    return float(np.mean(values))
+
+
+def _best_so_far(running_means):
+    """Best mean score accumulated so far (NaN candidates excluded)."""
+    finite = [value for value in running_means.values() if np.isfinite(value)]
+    if not finite:
+        return float("nan")
+    return float(max(finite))
+
+
 def _check_refit(search_cv, attr):
     if not search_cv.refit:
         raise AttributeError(
@@ -462,6 +491,8 @@ class BaseSearchCV(
         "pre_dispatch": [numbers.Integral, str],
         "error_score": [StrOptions({"raise"}), numbers.Real],
         "return_train_score": ["boolean"],
+        "stage_size": [Interval(numbers.Integral, 1, None, closed="left"), None],
+        "checkpoint": [str, os.PathLike, None],
     }
 
     @abstractmethod
@@ -477,6 +508,8 @@ class BaseSearchCV(
         pre_dispatch="2*n_jobs",
         error_score=np.nan,
         return_train_score=True,
+        stage_size=None,
+        checkpoint=None,
     ):
         self.scoring = scoring
         self.estimator = estimator
@@ -487,6 +520,8 @@ class BaseSearchCV(
         self.pre_dispatch = pre_dispatch
         self.error_score = error_score
         self.return_train_score = return_train_score
+        self.stage_size = stage_size
+        self.checkpoint = checkpoint
 
     def __sklearn_tags__(self):
         tags = super().__sklearn_tags__()
@@ -1004,7 +1039,13 @@ class BaseSearchCV(
         else:
             metadata_callbacks = None
         root_callback_ctx = self._init_callback_context(
-            max_subtasks=1 + (self.refit is not False)  # refit can be str or callable
+            # The staged path creates one subcontext per search stage, whose
+            # number is not known up front; leave the cap open in that case.
+            max_subtasks=(
+                None
+                if self.checkpoint is not None
+                else 1 + (self.refit is not False)  # refit can be str or callable
+            )
         ).call_on_fit_task_begin(estimator=self, X=X, y=y, metadata=metadata_callbacks)
 
         self._checked_cv_orig = check_cv(
@@ -1038,28 +1079,16 @@ class BaseSearchCV(
             all_out = []
             all_more_results = defaultdict(list)
 
-            def evaluate_candidates(
-                candidate_params, cv=None, more_results=None, callback_ctx=None
-            ):
-                cv = cv or self._checked_cv_orig
-                candidate_params = list(candidate_params)
+            def _run_batch(candidate_params, cv_splits, callback_ctx=None):
+                """Fit and score one batch of candidates on all CV splits.
+
+                Shared workhorse of the legacy ``evaluate_candidates`` path
+                and the staged/checkpoint path. The returned list is
+                candidate-major: ``n_candidates * n_splits`` entries with the
+                split index varying fastest.
+                """
                 n_candidates = len(candidate_params)
-                n_splits = self.n_splits_
-
-                cv_splits = list(cv.split(X, y, **routed_params.splitter.split))
-                if len(cv_splits) != n_splits:
-                    raise ValueError(
-                        f"cv.split and cv.get_n_splits return inconsistent results. "
-                        f"Expected {n_splits} splits, got {len(cv_splits)}"
-                    )
-
-                if self.verbose > 0:
-                    print(
-                        "Fitting {0} folds for each of {1} candidates,"
-                        " totalling {2} fits".format(
-                            n_splits, n_candidates, n_candidates * n_splits
-                        )
-                    )
+                n_splits = len(cv_splits)
 
                 candidate_split_pairs = list(
                     product(enumerate(candidate_params), enumerate(cv_splits))
@@ -1113,6 +1142,32 @@ class BaseSearchCV(
                 # of out will be done in `_insert_error_scores`.
                 if callable(self.scoring):
                     _insert_error_scores(out, self.error_score)
+                return out
+
+            def evaluate_candidates(
+                candidate_params, cv=None, more_results=None, callback_ctx=None
+            ):
+                cv = cv or self._checked_cv_orig
+                candidate_params = list(candidate_params)
+                n_candidates = len(candidate_params)
+                n_splits = self.n_splits_
+
+                cv_splits = list(cv.split(X, y, **routed_params.splitter.split))
+                if len(cv_splits) != n_splits:
+                    raise ValueError(
+                        f"cv.split and cv.get_n_splits return inconsistent results. "
+                        f"Expected {n_splits} splits, got {len(cv_splits)}"
+                    )
+
+                if self.verbose > 0:
+                    print(
+                        "Fitting {0} folds for each of {1} candidates,"
+                        " totalling {2} fits".format(
+                            n_splits, n_candidates, n_candidates * n_splits
+                        )
+                    )
+
+                out = _run_batch(candidate_params, cv_splits, callback_ctx)
 
                 all_candidate_params.extend(candidate_params)
                 all_out.extend(out)
@@ -1128,7 +1183,29 @@ class BaseSearchCV(
 
                 return results
 
-            if "callback_ctx" in signature(self._run_search).parameters:
+            if self.checkpoint is not None:
+                cv_splits = list(
+                    self._checked_cv_orig.split(
+                        X, y, **routed_params.splitter.split
+                    )
+                )
+                if len(cv_splits) != self.n_splits_:
+                    raise ValueError(
+                        "cv.split and cv.get_n_splits return inconsistent "
+                        f"results. Expected {self.n_splits_} splits, got "
+                        f"{len(cv_splits)}"
+                    )
+                all_candidate_params, all_out, results = self._fit_staged(
+                    X=X,
+                    y=y,
+                    cv_splits=cv_splits,
+                    run_batch=_run_batch,
+                    root_callback_ctx=root_callback_ctx,
+                    refit_metric=refit_metric,
+                    routed_params=routed_params,
+                    fit_metadata=params,
+                )
+            elif "callback_ctx" in signature(self._run_search).parameters:
                 self._run_search(evaluate_candidates, callback_ctx=root_callback_ctx)
             else:
                 # custom search classes
@@ -1205,6 +1282,214 @@ class BaseSearchCV(
         )
 
         return self
+
+    # ------------------------------------------------------------------
+    # Staged / resumable search
+    # ------------------------------------------------------------------
+    def _generate_candidates(self):
+        """Return the full, deterministically ordered candidate list.
+
+        Concrete search classes implement this so that the staged loop can
+        iterate, dedupe and checkpoint candidates without knowing how they
+        are produced.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support staged search yet."
+        )
+
+    def _candidate_space_spec(self):
+        """Return a stable description of the candidate space definition."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support staged search yet."
+        )
+
+    def _fit_staged(
+        self,
+        *,
+        X,
+        y,
+        cv_splits,
+        run_batch,
+        root_callback_ctx,
+        refit_metric,
+        routed_params,
+        fit_metadata,
+    ):
+        """Run the search in resumable stages backed by an on-disk checkpoint.
+
+        Returns ``(candidate_params, out, results)`` in exactly the same
+        candidate-major layout as the single-shot ``fit`` path so that the
+        downstream refit / best-parameter logic is shared unchanged.
+        """
+        from sklearn.model_selection._checkpoint import _STATE_VERSION
+
+        candidates = self._generate_candidates()
+        if not candidates:
+            raise ValueError(
+                "No candidates were produced by the parameter search; check "
+                "the parameter grid or distributions."
+            )
+
+        candidate_space = self._candidate_space_spec()
+        fingerprint = make_search_fingerprint(
+            estimator=self.estimator,
+            scoring=self.scoring,
+            cv=self._checked_cv_orig,
+            random_state=getattr(self, "random_state", None),
+            error_score=self.error_score,
+            return_train_score=self.return_train_score,
+            candidate_space=candidate_space,
+            X=X,
+            y=y,
+            # Hash the full fit metadata, including `groups` (routed to the
+            # splitter rather than the estimator) so any change is detected.
+            fit_params=fit_metadata,
+        )
+        expected = {
+            **fingerprint,
+            "state_version": _STATE_VERSION,
+            "refit_metric": refit_metric,
+        }
+
+        checkpoint = SearchCheckpoint(self.checkpoint)
+        # initialize() salvages corrupted segments first, so querying the
+        # evaluated set afterwards makes any record lost to corruption
+        # eligible for re-evaluation rather than leaving a hole.
+        resuming = checkpoint.initialize(
+            expected=expected, cv_splits=cv_splits
+        )
+        self.checkpoint_ = checkpoint
+
+        # Canonical candidate-major order. Keys normalise parameter names and
+        # float rendering, so repeated settings (e.g. sampling with
+        # replacement) and candidates carried over from an earlier, smaller
+        # space all collapse onto the same identity.
+        keys = [candidate_key(params) for params in candidates]
+        current_keys = set(keys)
+        key_to_indices = defaultdict(list)
+        for idx, key in enumerate(keys):
+            key_to_indices[key].append(idx)
+
+        if resuming:
+            stored_keys = checkpoint.evaluated_keys()
+            # The candidate space may grow between runs, but it must never
+            # drop a setting whose evaluation we would otherwise silently
+            # carry over as a dangling, incomparable result.
+            orphaned = stored_keys - current_keys
+            if orphaned:
+                raise CheckpointMismatchError(
+                    "Refusing to resume: the candidate space changed in a way "
+                    f"that removes {len(orphaned)} previously evaluated "
+                    "candidate(s). Only enlarging the space is supported. "
+                    "Use a new checkpoint directory to start a fresh search."
+                )
+            already_evaluated = stored_keys
+        else:
+            already_evaluated = set()
+
+        # Rebuild the running mean of every stored candidate with a single
+        # streaming pass so stage summaries keep an accurate best-so-far after
+        # a restart. Only one float per unique candidate is retained.
+        running_means = {}
+        if resuming:
+            for record in checkpoint.iter_records():
+                if record["key"] not in running_means:
+                    running_means[record["key"]] = _mean_test_score(
+                        record["out"], refit_metric
+                    )
+
+        stage_size = self.stage_size or len(candidates)
+        stage_idx = 0
+        # Stage boundaries are recomputed over the full candidate list each
+        # run, so enlarging the space between runs keeps the early stages
+        # identical and simply appends new stages at the end.
+        for start in range(0, len(candidates), stage_size):
+            chunk = candidates[start : start + stage_size]
+            chunk_keys = keys[start : start + stage_size]
+            pending = [
+                (offset, params)
+                for offset, (params, key) in enumerate(zip(chunk, chunk_keys))
+                if key not in already_evaluated
+            ]
+
+            if pending:
+                pending_params = [params for _offset, params in pending]
+                if self.verbose > 0:
+                    print(
+                        f"Stage {stage_idx}: fitting "
+                        f"{self.n_splits_} folds for each of "
+                        f"{len(pending_params)} new candidate(s) "
+                        f"({len(chunk) - len(pending_params)} skipped as "
+                        "already evaluated)"
+                    )
+
+                stage_ctx = root_callback_ctx.subcontext(
+                    task_name=f"search-stage-{stage_idx}",
+                    max_subtasks=len(pending_params) * self.n_splits_,
+                    sequential_subtasks=False,
+                ).call_on_fit_task_begin(estimator=self)
+
+                batch_out = run_batch(
+                    pending_params, cv_splits, stage_ctx
+                )
+
+                stage_ctx.call_on_fit_task_end(estimator=self)
+
+                records = []
+                n_splits = self.n_splits_
+                for row, (offset, params) in enumerate(pending):
+                    key = chunk_keys[offset]
+                    per_split = batch_out[
+                        row * n_splits : (row + 1) * n_splits
+                    ]
+                    records.append(
+                        {"key": key, "params": params, "out": per_split}
+                    )
+                    running_means[key] = _mean_test_score(
+                        per_split, refit_metric
+                    )
+
+                checkpoint.append_stage(
+                    stage_idx=stage_idx,
+                    records=records,
+                    summary={
+                        "n_candidates": len(records),
+                        "n_candidates_skipped": len(chunk) - len(pending),
+                        "best_so_far_score": _best_so_far(running_means),
+                    },
+                )
+                already_evaluated.update(rec["key"] for rec in records)
+            elif self.verbose > 0:
+                print(
+                    f"Stage {stage_idx}: all {len(chunk)} candidate(s) "
+                    "already evaluated, nothing to fit"
+                )
+            stage_idx += 1
+
+        # Stream the segments back from disk and place each record into its
+        # canonical position(s). Only the key set and the final candidate-
+        # sized arrays live in memory; individual segments are closed before
+        # the next one is opened.
+        out = [None] * (len(candidates) * self.n_splits_)
+        for record in checkpoint.iter_records():
+            for target_idx in key_to_indices.get(record["key"], ()):
+                base = target_idx * self.n_splits_
+                out[base : base + self.n_splits_] = record["out"]
+
+        missing = [i for i, value in enumerate(out) if value is None]
+        if missing:  # pragma: no cover - defensive, every key was evaluated
+            raise RuntimeError(
+                "Internal checkpoint error: "
+                f"{len(missing) // self.n_splits_} candidate(s) have no "
+                "evaluation result."
+            )
+
+        results = self._format_results(
+            candidates, self.n_splits_, out
+        )
+        self.n_evaluated_ = len(already_evaluated)
+        self.stage_summaries_ = checkpoint.stage_summaries()
+        return candidates, out, results
 
     def _format_results(self, candidate_params, n_splits, out, more_results=None):
         n_candidates = len(candidate_params)
@@ -1489,6 +1774,26 @@ class GridSearchCV(BaseSearchCV):
         expensive and is not strictly required to select the parameters that
         yield the best generalization performance.
 
+
+    stage_size : int, default=None
+        Number of candidates evaluated per search stage. When ``None`` (the
+        default) all candidates are evaluated in a single, uninterrupted
+        stage and the behaviour is identical to the non-staged search.
+        Setting ``stage_size`` together with ``checkpoint`` makes the search
+        resumable: after every stage the current best score and the number
+        of evaluated candidates are recorded, and a later ``fit`` call on a
+        compatible checkpoint skips candidates already evaluated.
+
+    checkpoint : str or path-like, default=None
+        Directory in which the resumable search state is stored. When
+        ``None`` (the default) no state is written and the historical
+        in-memory behaviour is preserved. The directory is created if it
+        does not exist. Resuming from a checkpoint whose training data,
+        random seed, cross-validation splits or scoring configuration
+        changed raises a
+        :class:`~sklearn.exceptions.CheckpointMismatchError`; a damaged
+        segment is salvaged where possible and reported through a
+        :class:`~sklearn.exceptions.CheckpointCorruptedWarning`.
     Attributes
     ----------
     cv_results_ : dict of numpy (masked) ndarrays
@@ -1677,6 +1982,8 @@ class GridSearchCV(BaseSearchCV):
         pre_dispatch="2*n_jobs",
         error_score=np.nan,
         return_train_score=False,
+        stage_size=None,
+        checkpoint=None,
     ):
         super().__init__(
             estimator=estimator,
@@ -1688,8 +1995,16 @@ class GridSearchCV(BaseSearchCV):
             pre_dispatch=pre_dispatch,
             error_score=error_score,
             return_train_score=return_train_score,
+            stage_size=stage_size,
+            checkpoint=checkpoint,
         )
         self.param_grid = param_grid
+
+    def _generate_candidates(self):
+        return list(ParameterGrid(self.param_grid))
+
+    def _candidate_space_spec(self):
+        return {"kind": "grid", "param_grid": self.param_grid}
 
     def _run_search(self, evaluate_candidates, *, callback_ctx=None):
         """Search all candidates in param_grid"""
@@ -1874,6 +2189,26 @@ class RandomizedSearchCV(BaseSearchCV):
         expensive and is not strictly required to select the parameters that
         yield the best generalization performance.
 
+
+    stage_size : int, default=None
+        Number of candidates evaluated per search stage. When ``None`` (the
+        default) all candidates are evaluated in a single, uninterrupted
+        stage and the behaviour is identical to the non-staged search.
+        Setting ``stage_size`` together with ``checkpoint`` makes the search
+        resumable: after every stage the current best score and the number
+        of evaluated candidates are recorded, and a later ``fit`` call on a
+        compatible checkpoint skips candidates already evaluated.
+
+    checkpoint : str or path-like, default=None
+        Directory in which the resumable search state is stored. When
+        ``None`` (the default) no state is written and the historical
+        in-memory behaviour is preserved. The directory is created if it
+        does not exist. Resuming from a checkpoint whose training data,
+        random seed, cross-validation splits or scoring configuration
+        changed raises a
+        :class:`~sklearn.exceptions.CheckpointMismatchError`; a damaged
+        segment is salvaged where possible and reported through a
+        :class:`~sklearn.exceptions.CheckpointCorruptedWarning`.
     Attributes
     ----------
     cv_results_ : dict of numpy (masked) ndarrays
@@ -2059,6 +2394,8 @@ class RandomizedSearchCV(BaseSearchCV):
         random_state=None,
         error_score=np.nan,
         return_train_score=False,
+        stage_size=None,
+        checkpoint=None,
     ):
         self.param_distributions = param_distributions
         self.n_iter = n_iter
@@ -2073,7 +2410,25 @@ class RandomizedSearchCV(BaseSearchCV):
             pre_dispatch=pre_dispatch,
             error_score=error_score,
             return_train_score=return_train_score,
+            stage_size=stage_size,
+            checkpoint=checkpoint,
         )
+
+    def _generate_candidates(self):
+        return list(
+            ParameterSampler(
+                self.param_distributions,
+                self.n_iter,
+                random_state=self.random_state,
+            )
+        )
+
+    def _candidate_space_spec(self):
+        return {
+            "kind": "randomized",
+            "param_distributions": self.param_distributions,
+            "n_iter": self.n_iter,
+        }
 
     def _run_search(self, evaluate_candidates, *, callback_ctx=None):
         """Search n_iter candidates from param_distributions"""
