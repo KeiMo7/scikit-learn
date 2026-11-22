@@ -304,6 +304,8 @@ DATA_VALIDATION_META_ESTIMATORS_TO_IGNORE = [
     "BaggingClassifier",
     "BaggingRegressor",
     "ClassifierChain",  # data validation is necessary
+    "ConformalClassifier",  # needs row indexing to split fit/calibration
+    "ConformalRegressor",  # needs row indexing to split fit/calibration
     "FrozenEstimator",  # this estimator cannot be tested like others.
     "IterativeImputer",
     "OneVsOneClassifier",  # input validation can't be avoided

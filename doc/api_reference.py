@@ -491,6 +491,19 @@ API_REFERENCE = {
             },
         ],
     },
+    "sklearn.conformal": {
+        "short_summary": "Conformal prediction.",
+        "description": _get_guide("conformal_prediction"),
+        "sections": [
+            {
+                "title": None,
+                "autosummary": [
+                    "ConformalRegressor",
+                    "ConformalClassifier",
+                ],
+            },
+        ],
+    },
     "sklearn.gaussian_process": {
         "short_summary": "Gaussian processes.",
         "description": _get_guide("gaussian_process"),

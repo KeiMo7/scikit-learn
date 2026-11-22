@@ -110,6 +110,7 @@ _submodules = [
     "discriminant_analysis",
     "impute",
     "compose",
+    "conformal",
 ]
 
 __all__ = _submodules + [

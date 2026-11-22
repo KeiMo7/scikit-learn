@@ -1,0 +1,9 @@
+- :class:`conformal.ConformalRegressor` and
+  :class:`conformal.ConformalClassifier` provide model-agnostic split
+  conformal prediction: prediction intervals for regression and candidate
+  label sets for classification with a finite-sample marginal coverage
+  guarantee under exchangeability. They support one- and two-sided
+  intervals, adaptive interval widths, LAC and randomized APS classification
+  scores, sample weights, group-aware splits with per-group (Mondrian)
+  coverage, cross-conformal fitting, and bitwise-stable pickle persistence.
+  By :user:`scikit-learn contributors`.

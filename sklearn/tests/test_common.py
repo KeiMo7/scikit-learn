@@ -499,6 +499,8 @@ NO_CALLBACK_SUPPORT = {
     "ClassifierChain",
     "ColumnTransformer",
     "ComplementNB",
+    "ConformalClassifier",
+    "ConformalRegressor",
     "CountVectorizer",
     "DBSCAN",
     "DecisionTreeClassifier",

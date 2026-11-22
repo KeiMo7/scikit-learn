@@ -22,4 +22,5 @@ Supervised learning
     modules/semi_supervised.rst
     modules/isotonic.rst
     modules/calibration.rst
+    modules/conformal.rst
     modules/neural_networks_supervised

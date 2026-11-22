@@ -13,6 +13,7 @@ import numpy as np
 
 from sklearn import clone, config_context
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.conformal import ConformalClassifier, ConformalRegressor
 from sklearn.cluster import (
     HDBSCAN,
     AffinityPropagation,
@@ -1000,6 +1001,26 @@ PER_ESTIMATOR_XFAIL_CHECKS: dict[type, dict[str, str]] = {
     },
     BisectingKMeans: {
         # TODO: replace by a statistical test, see meta-issue #16298
+        "check_sample_weight_equivalence_on_dense_data": (
+            "sample_weight is not equivalent to removing/repeating samples."
+        ),
+        "check_sample_weight_equivalence_on_sparse_data": (
+            "sample_weight is not equivalent to removing/repeating samples."
+        ),
+    },
+    ConformalClassifier: {
+        # The weighted conformal quantile reweights the calibration
+        # distribution, so weights are not equivalent to repeating samples.
+        "check_sample_weight_equivalence_on_dense_data": (
+            "sample_weight is not equivalent to removing/repeating samples."
+        ),
+        "check_sample_weight_equivalence_on_sparse_data": (
+            "sample_weight is not equivalent to removing/repeating samples."
+        ),
+    },
+    ConformalRegressor: {
+        # The weighted conformal quantile reweights the calibration
+        # distribution, so weights are not equivalent to repeating samples.
         "check_sample_weight_equivalence_on_dense_data": (
             "sample_weight is not equivalent to removing/repeating samples."
         ),
