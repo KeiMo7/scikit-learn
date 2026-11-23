@@ -1,0 +1,6 @@
+[group 1 exact_match]        verdict=valid  bit-identical=True max|delta proba|=0.000e+00
+[group 2 patch_difference]   verdict=compatible  code=version.patch_difference  predictions_available=True
+[group 3 column_reorder]     verdict=compatible  aligned_by_name=True  bit-identical=True
+[group 4 missing_column]     verdict=invalid  code=feature.missing  load_raises=True  source_unchanged=True
+[group 5 category_drift]     verdict=invalid  code=feature.category_drift  load_raises=True  source_unchanged=True  no_value_leak=True
+[legacy plain joblib]        readable=True  class=sklearn.linear_model._logistic.LogisticRegression

@@ -1,0 +1,113 @@
+{
+  "groups": [
+    {
+      "group": "exact_match",
+      "verdict": "valid",
+      "bit_identical_predict": true,
+      "bit_identical_predict_proba": true,
+      "max_abs_predict_proba_difference": 0.0,
+      "artifact_sha256": "5b87d073ac15159188b56fb76520b3da22cbd20f6ea5782ff108fd37b79a0d1c",
+      "findings": [],
+      "predict_head_before": [
+        1,
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        1
+      ],
+      "predict_head_after": [
+        1,
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        1
+      ],
+      "predict_proba_first_row_before": [
+        0.11264347786022366,
+        0.8873565221397763
+      ],
+      "predict_proba_first_row_after": [
+        0.11264347786022366,
+        0.8873565221397763
+      ]
+    },
+    {
+      "group": "patch_version_difference",
+      "verdict": "compatible",
+      "findings": [
+        {
+          "severity": "warning",
+          "code": "version.patch_difference",
+          "message": "dependency 'numpy' was fitted with '2.5.4', loading with '2.5.5'; patch-level difference, results should be reproduced but are not guaranteed bit-identical"
+        }
+      ],
+      "predictions_available": true
+    },
+    {
+      "group": "column_reorder",
+      "verdict": "compatible",
+      "reordered": true,
+      "findings": [
+        {
+          "severity": "info",
+          "code": "feature.reordered",
+          "message": "feature names match but their order differs; columns will be aligned by name rather than by position (6 columns)"
+        }
+      ],
+      "bit_identical_after_name_alignment": true
+    },
+    {
+      "group": "missing_column",
+      "verdict": "invalid",
+      "findings": [
+        {
+          "severity": "error",
+          "code": "feature.missing",
+          "message": "column 'city_berlin' (dtype 'float64') is required by the contract but absent from the current input"
+        }
+      ],
+      "load_raises_contract_validation_error": true,
+      "source_file_unchanged": true
+    },
+    {
+      "group": "category_drift",
+      "verdict": "invalid",
+      "findings": [
+        {
+          "severity": "error",
+          "code": "feature.category_drift",
+          "message": "column 'city': 1 category value(s) are not in the fit-time vocabulary and would be encoded as missing; prediction is refused"
+        }
+      ],
+      "load_raises_contract_validation_error": true,
+      "source_file_unchanged": true,
+      "offending_value_absent_from_messages": true
+    }
+  ],
+  "legacy_artifact": {
+    "contract_format": "legacy",
+    "estimator_class": "sklearn.linear_model._logistic.LogisticRegression",
+    "artifact_path": "/home/wll/uid42/output/artifacts/legacy_plain.joblib",
+    "param_summary": {
+      "C": "deprecated",
+      "alpha": 1.0,
+      "class_weight": null,
+      "dual": "deprecated",
+      "fit_intercept": true,
+      "intercept_scaling": "deprecated",
+      "l1_ratio": 0.0,
+      "max_iter": 500,
+      "random_state": 42,
+      "solver": "auto",
+      "tol": 0.0001,
+      "verbose": 0,
+      "warm_start": false
+    }
+  }
+}
